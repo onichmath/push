@@ -385,6 +385,9 @@ def _leader_pred(
             # results_dict["logits"] = preds
         if "prob" in mode:
             results_dict["prob"] = stacked_preds
+        if "mean" in mode:
+            mean_probs = torch.mean(stacked_preds, dim=1)
+            results_dict["mean"] = torch.argmax(mean_probs, dim=1)
         if "mode" in mode:
             cls = [tensor_list.argmax(dim=1) for tensor_list in t_preds_softmax]
             stacked_cls = torch.stack(cls)
