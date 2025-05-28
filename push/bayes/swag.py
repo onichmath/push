@@ -5,10 +5,11 @@ from tqdm import tqdm
 from typing import *
 from collections import defaultdict
 from push.bayes.infer import Infer
-from push.particle import Particle
+from push.particle import Particle, ParticleView
 from push.bayes.utils import flatten, unflatten_like
 from push.lib.utils import detach_to_cpu
 import torch.optim.lr_scheduler as lr_scheduler
+import os
 
 
 # =============================================================================
@@ -29,6 +30,64 @@ def mk_scheduler(optim):
     # return lr_scheduler.StepLR(optim, step_size=200, gamma=0.1)
     # return lr_scheduler.ExponentialLR(optim, gamma=0.1, last_epoch=-1, verbose='deprecated')
     return lr_scheduler.LinearLR(optim, start_factor=1.0, end_factor=1.0, total_iters=1)
+
+
+def save_swag_moments(particle: Particle, save_dir: str, epoch: int) -> None:
+    """Save SWAG moments (mom1, mom2, cov_mat_sqrt) to disk.
+    
+    Args:
+        particle (Particle): The particle whose moments to save
+        save_dir (str): Directory to save the moments
+        epoch (int): Current epoch number
+    """
+    pid = particle.pid
+    state = particle.state[pid]
+    
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save each moment
+    torch.save(state["mom1"], os.path.join(save_dir, f"particle{pid}_epoch{epoch}_mom1.pt"))
+    torch.save(state["mom2"], os.path.join(save_dir, f"particle{pid}_epoch{epoch}_mom2.pt"))
+    torch.save(state["cov_mat_sqrt"], os.path.join(save_dir, f"particle{pid}_epoch{epoch}_cov_mat_sqrt.pt"))
+
+
+def save_particle_weights(particle: Particle, save_dir: str, epoch: int) -> None:
+    """Save particle weights to disk.
+    
+    Args:
+        particle (Particle): The particle whose weights to save
+        save_dir (str): Directory to save the weights
+        epoch (int): Current epoch number
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save model state dict
+    torch.save(particle.module.state_dict(), 
+              os.path.join(save_dir, f"particle{particle.pid}_epoch{epoch}_weights.pt"))
+
+
+def save_all_particle_weights(particle: Particle, other_pids: List[int], save_dir: str, epoch: int) -> None:
+    """Save weights for all particles in the ensemble.
+    
+    Args:
+        particle (Particle): The lead particle
+        other_pids (List[int]): List of other particle IDs
+        save_dir (str): Directory to save the weights
+        epoch (int): Current epoch number
+    """
+    # Save lead particle weights
+    save_particle_weights(particle, save_dir, epoch)
+    
+    # Save other particles' weights
+    for pid in other_pids:
+        # Get the other particle's module state dict
+        fut = particle.send(pid, "GET_MODULE_STATE")
+        state_dict = fut.wait()
+        # Save it
+        os.makedirs(save_dir, exist_ok=True)
+        torch.save(state_dict, os.path.join(save_dir, f"particle{pid}_epoch{epoch}_weights.pt"))
 
 
 # =============================================================================
@@ -227,10 +286,13 @@ def _mswag_particle(
             swag_epochs=swag_epochs,
             swag_pids=swag_pids,
         )
-
     else:
         # TRAINING DONE HERE
         other_pids = [pid for pid in swag_pids if pid != particle.pid]
+        
+        # Save initial weights before pretraining for all particles (epoch 0)
+        save_all_particle_weights(particle, other_pids, "pretrain_weights", 0)
+        
         tq = tqdm(range(pretrain_epochs))
         # Pre-training loop
         for e in tq:
@@ -243,11 +305,20 @@ def _mswag_particle(
                 ]
                 losses += [fut.wait()]
             tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
-            # print("Average epoch loss", torch.mean(torch.tensor(losses)))
+            
+            # Save weights after each pretraining epoch for all particles (epochs 1 to pretrain_epochs)
+            save_all_particle_weights(particle, other_pids, "pretrain_weights", e + 1)
 
         # Initialize SWAG
         [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
         _swag_swag(particle, True, cov_mat_rank)
+        
+        # Save initial SWAG moments for all particles (epoch 0)
+        save_swag_moments(particle, "swag_moments", 0)
+        for pid in other_pids:
+            fut = particle.send(pid, "SAVE_SWAG_MOMENTS", "swag_moments", 0)
+            fut.wait()
+        
         tq = tqdm(range(swag_epochs))
         # SWAG epochs
         for e in tq:
@@ -268,7 +339,12 @@ def _mswag_particle(
             _swag_swag(particle, False, cov_mat_rank)
             [f.wait() for f in futs]
             tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
-            # print("Average epoch loss", torch.mean(torch.tensor(losses)))
+            
+            # Save SWAG moments after each SWAG epoch for all particles (epochs 1 to swag_epochs)
+            save_swag_moments(particle, "swag_moments", e + 1)
+            for pid in other_pids:
+                fut = particle.send(pid, "SAVE_SWAG_MOMENTS", "swag_moments", e + 1)
+                fut.wait()
 
 
 # =============================================================================
@@ -878,6 +954,8 @@ class MultiSWAG(Infer):
                         "SWAG_SWAG": _swag_swag,
                         "SWAG_SAMPLE": mswag_sample,
                         "SWAG_PRED": _mswag_pred,
+                        "GET_MODULE_STATE": lambda p: p.module.state_dict(),
+                        "SAVE_SWAG_MOMENTS": lambda p, save_dir, epoch: save_swag_moments(p, save_dir, epoch),
                     },
                     state=mswag_state,
                 )
