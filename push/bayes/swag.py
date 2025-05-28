@@ -114,6 +114,88 @@ def _swag_swag(particle: Particle, reset: bool, cov_mat_rank: int) -> None:
         state["n"] += 1
 
 
+def _bootstrap_mswag_particle(
+    particle: Particle,
+    dataloader: DataLoader,
+    loss_fn: Callable,
+    cov_mat_rank: int,
+    pretrain_epochs: int,
+    swag_epochs: int,
+    swag_pids: List[int],
+) -> None:
+    num_ensembles = len(swag_pids)
+    other_pids = [pid for pid in swag_pids if pid != particle.pid]
+
+    def generate_bootstrap(seed, n_samples):
+        torch.manual_seed(seed)
+        return torch.randint(0, n_samples, (n_samples,), dtype=torch.long)
+
+    def build_bootstrap_datasets(n_estimators, data_loader):
+        X, Y = [], []
+        for inputs, labels in data_loader:
+            X.append(inputs)
+            Y.append(labels)
+        X = torch.cat(X, dim=0)
+        Y = torch.cat(Y, dim=0)
+
+        n_samples = len(X)
+        bootstraps = [
+            generate_bootstrap(42 * i, n_samples) for i in range(1, n_estimators + 1)
+        ]
+        dataloaders = []
+        for indices in bootstraps:
+            X_b = torch.index_select(X, 0, indices)
+            Y_b = torch.index_select(Y, 0, indices)
+            dataset = TensorDataset(X_b, Y_b)
+            dataloader = DataLoader(
+                dataset, batch_size=data_loader.batch_size, shuffle=True
+            )
+            dataloaders.append(dataloader)
+        return dataloaders
+
+    bootstrap_dataloaders = build_bootstrap_datasets(num_ensembles, dataloader)
+
+    # Training loop
+    tq = tqdm(range(pretrain_epochs))
+    for e in tq:
+        losses = []
+        for i, dataloader in enumerate(bootstrap_dataloaders):
+            if i == 0:
+                for data, label in dataloader:
+                    fut = particle.step(loss_fn, data, label)
+                    # loss = particle.step(loss_fn, data, label).wait()
+                    losses += [fut.wait()]
+            else:
+                for data, label in dataloader:
+                    fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
+                    # losses += [fut.wait()]
+        tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+
+    # Initialize SWAG
+    [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
+
+    _swag_swag(particle, True, cov_mat_rank)
+    tq = tqdm(range(swag_epochs))
+
+    for e in tq:
+        losses = []
+        for i, dataloader in enumerate(bootstrap_dataloaders):
+            if i == 0:
+                for data, label in dataloader:
+                    fut = particle.step(loss_fn, data, label)
+                    # loss = particle.step(loss_fn, data, label).wait()
+                    losses += [fut.wait()]
+            else:
+                for data, label in dataloader:
+                    fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
+        futs = [
+            particle.send(pid, "SWAG_SWAG", False, cov_mat_rank) for pid in other_pids
+        ]
+        _swag_swag(particle, False, cov_mat_rank)
+        [f.wait() for f in futs]
+        tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+
+
 def _mswag_particle(
     particle: Particle,
     dataloader,
@@ -136,83 +218,15 @@ def _mswag_particle(
         swag_pids (list[int]): List of SWAG particle IDs.
     """
     if bootstrap:
-        num_ensembles = len(swag_pids)
-        other_pids = [pid for pid in swag_pids if pid != particle.pid]
-
-        def generate_bootstrap(seed, n_samples):
-            torch.manual_seed(seed)
-            return torch.randint(0, n_samples, (n_samples,), dtype=torch.long)
-
-        def build_bootstrap_datasets(n_estimators, data_loader):
-            X, Y = [], []
-            for inputs, labels in data_loader:
-                X.append(inputs)
-                Y.append(labels)
-            X = torch.cat(X, dim=0)
-            Y = torch.cat(Y, dim=0)
-
-            n_samples = len(X)
-            bootstraps = [
-                generate_bootstrap(42 * i, n_samples)
-                for i in range(1, n_estimators + 1)
-            ]
-            dataloaders = []
-            for indices in bootstraps:
-                X_b = torch.index_select(X, 0, indices)
-                Y_b = torch.index_select(Y, 0, indices)
-                dataset = TensorDataset(X_b, Y_b)
-                dataloader = DataLoader(
-                    dataset, batch_size=data_loader.batch_size, shuffle=True
-                )
-                dataloaders.append(dataloader)
-            return dataloaders
-
-        bootstrap_dataloaders = build_bootstrap_datasets(num_ensembles, dataloader)
-
-        # Training loop
-        tq = tqdm(range(pretrain_epochs))
-        for e in tq:
-            losses = []
-            for i, dataloader in enumerate(bootstrap_dataloaders):
-                if i == 0:
-                    for data, label in dataloader:
-                        fut = particle.step(loss_fn, data, label)
-                        # loss = particle.step(loss_fn, data, label).wait()
-                        losses += [fut.wait()]
-                else:
-                    for data, label in dataloader:
-                        fut = particle.send(
-                            swag_pids[i], "SWAG_STEP", loss_fn, data, label
-                        )
-                        # losses += [fut.wait()]
-            tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
-
-        # Initialize SWAG
-        [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
-
-        _swag_swag(particle, True, cov_mat_rank)
-        tq = tqdm(range(swag_epochs))
-
-        for e in tq:
-            losses = []
-            for i, dataloader in enumerate(bootstrap_dataloaders):
-                if i == 0:
-                    for data, label in dataloader:
-                        fut = particle.step(loss_fn, data, label)
-                        # loss = particle.step(loss_fn, data, label).wait()
-                        losses += [fut.wait()]
-                else:
-                    for data, label in dataloader:
-                        fut = particle.send(
-                            swag_pids[i], "SWAG_STEP", loss_fn, data, label
-                        )
-            futs = [
-                particle.send(pid, "SWAG_SWAG", False, cov_mat_rank)
-                for pid in other_pids
-            ]
-            _swag_swag(particle, False, cov_mat_rank)
-            [f.wait() for f in futs]
-            tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+        _bootstrap_mswag_particle(
+            particle=particle,
+            dataloader=dataloader,
+            loss_fn=loss_fn,
+            cov_mat_rank=cov_mat_rank,
+            pretrain_epochs=pretrain_epochs,
+            swag_epochs=swag_epochs,
+            swag_pids=swag_pids,
+        )
 
     else:
         # TRAINING DONE HERE
