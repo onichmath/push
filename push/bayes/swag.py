@@ -1052,6 +1052,7 @@ class MultiSWAG(Infer):
                 num_samples,
                 mode,
                 len(self.swag_pids),
+                f_reg,
             )
             return self.push_dist.p_wait([fut])[fut._fid]
         elif isinstance(data, DataLoader):
