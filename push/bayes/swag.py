@@ -16,7 +16,19 @@ import os
 # Helper functions
 # =============================================================================
 # TODO: pass this in or use .gin configs instead of global var for saving
-SAVE_WEIGHTS = False
+SAVE_WEIGHTS = True
+
+
+def _set_swag_state_helper(particle, mom1, mom2, cov_mat_sqrt):
+    """Helper function to set SWAG state and model weights to mean."""
+    # Set the SWAG moments
+    particle.state[particle.pid]["mom1"] = mom1
+    particle.state[particle.pid]["mom2"] = mom2
+    particle.state[particle.pid]["cov_mat_sqrt"] = cov_mat_sqrt
+    
+    # Set model parameters to the mean for deterministic evaluation
+    for param, mean_param in zip(particle.module.parameters(), mom1):
+        param.data.copy_(mean_param.data)
 
 
 def mk_scheduler(optim):
@@ -51,14 +63,14 @@ def save_swag_moments(particle: Particle, save_dir: str, epoch: int) -> None:
     os.makedirs(save_dir, exist_ok=True)
 
     torch.save(
-        state["mom1"], os.path.join(save_dir, f"_particle{pid}_epoch{epoch}_mom1.pt")
+        state["mom1"], os.path.join(save_dir, f"particle{pid}_epoch{epoch}_mom1.pt")
     )
     torch.save(
-        state["mom2"], os.path.join(save_dir, f"_particle{pid}_epoch{epoch}_mom2.pt")
+        state["mom2"], os.path.join(save_dir, f"particle{pid}_epoch{epoch}_mom2.pt")
     )
     torch.save(
         state["cov_mat_sqrt"],
-        os.path.join(save_dir, f"_particle{pid}_epoch{epoch}_cov_mat_sqrt.pt"),
+        os.path.join(save_dir, f"particle{pid}_epoch{epoch}_cov_mat_sqrt.pt"),
     )
 
 
@@ -77,7 +89,7 @@ def save_particle_weights(particle: Particle, save_dir: str, epoch: int) -> None
 
     torch.save(
         particle.module.state_dict(),
-        os.path.join(save_dir, f"_particle{particle.pid}_epoch{epoch}_weights.pt"),
+        os.path.join(save_dir, f"particle{particle.pid}_epoch{epoch}_weights.pt"),
     )
 
 
@@ -104,7 +116,7 @@ def save_all_particle_weights(
         os.makedirs(save_dir, exist_ok=True)
         torch.save(
             state_dict,
-            os.path.join(save_dir, f"_particle{pid}_epoch{epoch}_weights.pt"),
+            os.path.join(save_dir, f"particle{pid}_epoch{epoch}_weights.pt"),
         )
 
 
@@ -1057,6 +1069,155 @@ class MultiSWAG(Infer):
             return self.push_dist.p_wait([fut])[fut._fid]
         else:
             raise ValueError(f"Data of type {type(data)} not supported ...")
+
+    def load_from_pretrained_epoch(
+        self,
+        opt: str,
+        epoch: int,
+        num_models: int = 1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    ) -> None:
+        """Load a MultiSWAG ensemble from pretrained weights at a specific epoch."""
+        weights_dir = os.path.join("results", opt, "pretrain_weights")
+        
+        # Create particles for each model
+        self.swag_pids = []
+        for model_num in range(num_models):
+            # Load pretrained weights
+            weights_path = os.path.join(weights_dir, f"particle{model_num}_epoch{epoch}_weights.pt")
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"Pretrained weights not found at {weights_path}")
+            
+            # Load weights
+            state_dict = torch.load(weights_path, map_location=device)
+            
+            # Create particle for this model
+            if model_num == 0:
+                # Lead particle needs prediction handlers
+                param_pid = self.push_dist.p_create(
+                    lambda params: torch.optim.Adam(params, lr=0.01),
+                    mk_scheduler,
+                    False,  # no prior
+                    -1,  # no random seed
+                    device=(model_num % self.num_devices),
+                    receive={
+                        "SWAG_STEP": _swag_step,
+                        "SWAG_SWAG": _swag_swag,
+                        "SWAG_SAMPLE": _mswag_sample,
+                        "SWAG_PRED": _mswag_pred,
+                        "GET_MODULE_STATE": lambda p: p.module.state_dict(),
+                        "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                        "LEADER_PRED": _leader_pred,
+                        "LEADER_PRED_DL": _leader_pred_dl,
+                    },
+                    state={},
+                )
+            else:
+                param_pid = self.push_dist.p_create(
+                    lambda params: torch.optim.Adam(params, lr=0.01),
+                    mk_scheduler,
+                    False,  # no prior
+                    -1,  # no random seed
+                    device=(model_num % self.num_devices),
+                    receive={
+                        "SWAG_STEP": _swag_step,
+                        "SWAG_SWAG": _swag_swag,
+                        "SWAG_SAMPLE": _mswag_sample,
+                        "SWAG_PRED": _mswag_pred,
+                        "GET_MODULE_STATE": lambda p: p.module.state_dict(),
+                        "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                    },
+                    state={},
+                )
+            self.swag_pids.append(param_pid)
+            
+            # Load weights into particle using message passing
+            fut = self.push_dist.p_launch(param_pid, "SET_MODULE_STATE", state_dict)
+            self.push_dist.p_wait([fut])
+            
+            # Initialize SWAG moments after loading weights
+            fut = self.push_dist.p_launch(param_pid, "SWAG_SWAG", True, 20)  # cov_mat_rank=20
+            self.push_dist.p_wait([fut])
+
+    def load_from_swag_epoch(
+        self,
+        opt: str,
+        epoch: int,
+        num_models: int = 1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    ) -> None:
+        """Load a MultiSWAG ensemble from SWAG moments at a specific epoch."""
+        weights_dir = os.path.join("results", opt, "swag_moments")
+        
+        # Create particles for each model
+        self.swag_pids = []
+        for model_num in range(num_models):
+            # Load SWAG moments using model_num to match the saving pattern
+            mom1_path = os.path.join(weights_dir, f"particle{model_num}_epoch{epoch}_mom1.pt")
+            mom2_path = os.path.join(weights_dir, f"particle{model_num}_epoch{epoch}_mom2.pt")
+            cov_path = os.path.join(weights_dir, f"particle{model_num}_epoch{epoch}_cov_mat_sqrt.pt")
+            
+            if not all(os.path.exists(p) for p in [mom1_path, mom2_path, cov_path]):
+                raise FileNotFoundError(f"SWAG moments not found in {weights_dir}")
+            
+            # Load moments
+            mom1 = torch.load(mom1_path, map_location=device)
+            mom2 = torch.load(mom2_path, map_location=device)
+            cov_mat_sqrt = torch.load(cov_path, map_location=device)
+            
+            # Create particle for this model
+            if model_num == 0:
+                # Lead particle needs prediction handlers
+                param_pid = self.push_dist.p_create(
+                    lambda params: torch.optim.Adam(params, lr=0.01),
+                    mk_scheduler,
+                    False,
+                    -1,
+                    device=(model_num % self.num_devices),
+                    receive={
+                        "SWAG_STEP": _swag_step,
+                        "SWAG_SWAG": _swag_swag,
+                        "SWAG_SAMPLE": _mswag_sample,
+                        "SWAG_PRED": _mswag_pred,
+                        "GET_MODULE_STATE": lambda p: p.module.state_dict(),
+                        "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                        "SET_SWAG_STATE": lambda p, mom1, mom2, cov_mat_sqrt: _set_swag_state_helper(p, mom1, mom2, cov_mat_sqrt),
+                        "SET_TO_MEAN": lambda p: [param.data.copy_(mean_param.data) 
+                                                for param, mean_param in zip(p.module.parameters(), p.state[p.pid]['mom1'])],
+                        "LEADER_PRED": _leader_pred,
+                        "LEADER_PRED_DL": _leader_pred_dl,
+                    },
+                    state={"n": epoch},
+                )
+            else:
+                param_pid = self.push_dist.p_create(
+                    lambda params: torch.optim.Adam(params, lr=0.01),
+                    mk_scheduler,
+                    False,
+                    -1,
+                    device=(model_num % self.num_devices),
+                    receive={
+                        "SWAG_STEP": _swag_step,
+                        "SWAG_SWAG": _swag_swag,
+                        "SWAG_SAMPLE": _mswag_sample,
+                        "SWAG_PRED": _mswag_pred,
+                        "GET_MODULE_STATE": lambda p: p.module.state_dict(),
+                        "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                        "SET_SWAG_STATE": lambda p, mom1, mom2, cov_mat_sqrt: _set_swag_state_helper(p, mom1, mom2, cov_mat_sqrt),
+                        "SET_TO_MEAN": lambda p: [param.data.copy_(mean_param.data) 
+                                                for param, mean_param in zip(p.module.parameters(), p.state[p.pid]['mom1'])],
+                    },
+                    state={"n": epoch},
+                )
+            self.swag_pids.append(param_pid)
+            
+            # Initialize SWAG state structure
+            fut = self.push_dist.p_launch(param_pid, "SWAG_SWAG", True, 20)
+            self.push_dist.p_wait([fut])
+            
+            # Set the loaded moments and model weights to mean
+            fut = self.push_dist.p_launch(param_pid, "SET_SWAG_STATE", mom1, mom2, cov_mat_sqrt)
+            self.push_dist.p_wait([fut])
 
 
 # =============================================================================
