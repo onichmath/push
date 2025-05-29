@@ -1107,10 +1107,13 @@ class MultiSWAG(Infer):
                         "SWAG_PRED": _mswag_pred,
                         "GET_MODULE_STATE": lambda p: p.module.state_dict(),
                         "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                        "SET_SWAG_STATE": lambda p, mom1, mom2, cov_mat_sqrt: _set_swag_state_helper(p, mom1, mom2, cov_mat_sqrt),
+                        "SET_TO_MEAN": lambda p: [param.data.copy_(mean_param.data) 
+                                                for param, mean_param in zip(p.module.parameters(), p.state[p.pid]['mom1'])],
                         "LEADER_PRED": _leader_pred,
                         "LEADER_PRED_DL": _leader_pred_dl,
                     },
-                    state={},
+                    state={"n": 1},  # Initialize with n=1 since we're starting SWAG from this pretrained point
                 )
             else:
                 param_pid = self.push_dist.p_create(
@@ -1126,8 +1129,11 @@ class MultiSWAG(Infer):
                         "SWAG_PRED": _mswag_pred,
                         "GET_MODULE_STATE": lambda p: p.module.state_dict(),
                         "SET_MODULE_STATE": lambda p, state_dict: p.module.load_state_dict(state_dict),
+                        "SET_SWAG_STATE": lambda p, mom1, mom2, cov_mat_sqrt: _set_swag_state_helper(p, mom1, mom2, cov_mat_sqrt),
+                        "SET_TO_MEAN": lambda p: [param.data.copy_(mean_param.data) 
+                                                for param, mean_param in zip(p.module.parameters(), p.state[p.pid]['mom1'])],
                     },
-                    state={},
+                    state={"n": 1},  # Initialize with n=1 since we're starting SWAG from this pretrained point
                 )
             self.swag_pids.append(param_pid)
             
@@ -1135,7 +1141,7 @@ class MultiSWAG(Infer):
             fut = self.push_dist.p_launch(param_pid, "SET_MODULE_STATE", state_dict)
             self.push_dist.p_wait([fut])
             
-            # Initialize SWAG moments after loading weights
+            # Initialize SWAG moments after loading weights (this creates mom1, mom2, cov_mat_sqrt from current model state)
             fut = self.push_dist.p_launch(param_pid, "SWAG_SWAG", True, 20)  # cov_mat_rank=20
             self.push_dist.p_wait([fut])
 
