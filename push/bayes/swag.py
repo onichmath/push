@@ -211,7 +211,71 @@ def _bootstrap_mswag_particle(
     pretrain_epochs: int,
     swag_epochs: int,
     swag_pids: List[int],
+    val_dataloader=None,
+    val_corrupt_dataloader=None,
+    save_metrics: bool = True,
+    optimizer_name: str = "unknown",
 ) -> None:
+    """Bootstrap MSWAG particle training with metric saving."""
+    
+    print(f"🐛 DEBUG: _bootstrap_mswag_particle called with save_metrics={save_metrics}, optimizer_name={optimizer_name}")
+    
+    def evaluate_model(model, dataloader, device):
+        """Evaluate model on a dataloader and return accuracy."""
+        if dataloader is None:
+            return 0.0
+            
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, labels in dataloader:
+                data, labels = data.to(device), labels.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        model.train()
+        return correct / total if total > 0 else 0.0
+    
+    def save_epoch_metrics(epoch, phase, train_loss, val_acc=None, val_corrupt_acc=None):
+        """Save metrics for a given epoch."""
+        print(f"🐛 DEBUG: Bootstrap save_epoch_metrics called - epoch={epoch}, phase={phase}, save_metrics={save_metrics}, optimizer_name={optimizer_name}")
+        
+        if not save_metrics:
+            print(f"🐛 DEBUG: save_metrics is False, skipping save")
+            return
+            
+        metrics = {
+            'epoch': epoch,
+            'phase': phase,
+            'train_loss': train_loss,
+            'val_acc': val_acc,
+            'val_corrupt_acc': val_corrupt_acc
+        }
+        
+        # Create results directory structure
+        results_dir = f"results/{optimizer_name}/evaluation_results"
+        print(f"🐛 DEBUG: Creating directory: {results_dir}")
+        os.makedirs(results_dir, exist_ok=True)
+        
+        # Save metrics
+        metrics_file = os.path.join(results_dir, f"{phase}_epoch{epoch}_metrics.pt")
+        print(f"🐛 DEBUG: Saving metrics to: {metrics_file}")
+        torch.save(metrics, metrics_file)
+        
+        # Also save individual loss file for backward compatibility
+        loss_data = {
+            'epoch': epoch,
+            'phase': phase,
+            'loss': train_loss
+        }
+        loss_file = os.path.join(results_dir, f"{phase}_epoch{epoch}_loss.pt")
+        print(f"🐛 DEBUG: Saving loss to: {loss_file}")
+        torch.save(loss_data, loss_file)
+
     num_ensembles = len(swag_pids)
     other_pids = [pid for pid in swag_pids if pid != particle.pid]
 
@@ -244,6 +308,9 @@ def _bootstrap_mswag_particle(
 
     bootstrap_dataloaders = build_bootstrap_datasets(num_ensembles, dataloader)
 
+    # Save initial weights for all particles (epoch 0)
+    save_all_particle_weights(particle, other_pids, f"results/{optimizer_name}/pretrain_weights", 0)
+
     # Training loop
     tq = tqdm(range(pretrain_epochs))
     for e in tq:
@@ -252,37 +319,96 @@ def _bootstrap_mswag_particle(
             if i == 0:
                 for data, label in dataloader:
                     fut = particle.step(loss_fn, data, label)
-                    # loss = particle.step(loss_fn, data, label).wait()
                     losses += [fut.wait()]
             else:
                 for data, label in dataloader:
                     fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
-                    # losses += [fut.wait()]
-        tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+                    # losses += [fut.wait()]  # Don't wait for other particles
+        
+        # Calculate average training loss
+        avg_train_loss = torch.mean(torch.tensor(losses)).item()
+        
+        # Evaluate on validation sets
+        val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+        val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+        
+        # Save metrics for this epoch
+        save_epoch_metrics(e + 1, "pretrain", avg_train_loss, val_acc, val_corrupt_acc)
+        
+        # Update progress bar
+        tq.set_postfix({
+            "loss": avg_train_loss,
+            "val_acc": f"{val_acc:.3f}",
+            "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
+        })
+
+        # Save weights after each pretraining epoch for all particles
+        save_all_particle_weights(particle, other_pids, f"results/{optimizer_name}/pretrain_weights", e + 1)
 
     # Initialize SWAG
     [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
-
     _swag_swag(particle, True, cov_mat_rank)
-    tq = tqdm(range(swag_epochs))
 
+    # Save initial SWAG moments for all particles (epoch 0)
+    save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", 0)
+    for pid in other_pids:
+        fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", 0)
+        fut.wait()
+
+    tq = tqdm(range(swag_epochs))
     for e in tq:
         losses = []
         for i, dataloader in enumerate(bootstrap_dataloaders):
             if i == 0:
                 for data, label in dataloader:
                     fut = particle.step(loss_fn, data, label)
-                    # loss = particle.step(loss_fn, data, label).wait()
                     losses += [fut.wait()]
             else:
                 for data, label in dataloader:
                     fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
+        
         futs = [
             particle.send(pid, "SWAG_SWAG", False, cov_mat_rank) for pid in other_pids
         ]
         _swag_swag(particle, False, cov_mat_rank)
         [f.wait() for f in futs]
-        tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+        
+        # Calculate average training loss
+        avg_train_loss = torch.mean(torch.tensor(losses)).item()
+        
+        # For SWAG phase, evaluate using SWAG mean
+        if particle.pid in particle.state and "mom1" in particle.state[particle.pid]:
+            # Temporarily set model to SWAG mean for evaluation
+            original_params = [p.clone() for p in particle.module.parameters()]
+            for param, mean_param in zip(particle.module.parameters(), particle.state[particle.pid]["mom1"]):
+                param.data.copy_(mean_param.data)
+            
+            # Evaluate with SWAG mean
+            val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+            val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+            
+            # Restore original parameters
+            for param, orig_param in zip(particle.module.parameters(), original_params):
+                param.data.copy_(orig_param.data)
+        else:
+            val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+            val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+        
+        # Save metrics for this SWAG epoch
+        save_epoch_metrics(e + 1, "swag", avg_train_loss, val_acc, val_corrupt_acc)
+        
+        # Update progress bar
+        tq.set_postfix({
+            "loss": avg_train_loss,
+            "val_acc": f"{val_acc:.3f}",
+            "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
+        })
+
+        # Save SWAG moments after each SWAG epoch for all particles
+        save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", e + 1)
+        for pid in other_pids:
+            fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", e + 1)
+            fut.wait()
 
 
 def _mswag_particle(
@@ -294,19 +420,89 @@ def _mswag_particle(
     swag_epochs: int,
     swag_pids: List[int],
     bootstrap: bool,
+    val_dataloader=None,
+    val_corrupt_dataloader=None,
+    save_metrics: bool = True,
+    optimizer_name: str = "unknown",
 ) -> None:
     """Training function for MSWAG particle.
 
     Args:
         particle (Particle): MSWAG particle.
-        dataloader (DataLoader): DataLoader.
+        dataloader (DataLoader): Training DataLoader.
         loss_fn (Callable): Loss function.
         cov_mat_rank (int): Maximum rank of low rank plus diagonal covariance matrix
         pretrain_epochs (int): Number of pre-training epochs.
         swag_epochs (int): Number of SWAG epochs.
         swag_pids (list[int]): List of SWAG particle IDs.
+        bootstrap (bool): Whether to use bootstrap sampling.
+        val_dataloader: Validation DataLoader.
+        val_corrupt_dataloader: Corrupted validation DataLoader.
+        save_metrics (bool): Whether to save metrics at each epoch.
+        optimizer_name (str): Name of the optimizer for organizing results.
     """
+    
+    print(f"🐛 DEBUG: _mswag_particle called with bootstrap={bootstrap}, save_metrics={save_metrics}, optimizer_name={optimizer_name}")
+    print(f"🐛 DEBUG: pretrain_epochs={pretrain_epochs}, swag_epochs={swag_epochs}")
+    
+    def evaluate_model(model, dataloader, device):
+        """Evaluate model on a dataloader and return accuracy."""
+        if dataloader is None:
+            return 0.0
+            
+        model.eval()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, labels in dataloader:
+                data, labels = data.to(device), labels.to(device)
+                outputs = model(data)
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        model.train()
+        return correct / total if total > 0 else 0.0
+    
+    def save_epoch_metrics(epoch, phase, train_loss, val_acc=None, val_corrupt_acc=None, optimizer_name="unknown"):
+        """Save metrics for a given epoch."""
+        print(f"🐛 DEBUG: save_epoch_metrics called - epoch={epoch}, phase={phase}, save_metrics={save_metrics}, optimizer_name={optimizer_name}")
+        
+        if not save_metrics:
+            print(f"🐛 DEBUG: save_metrics is False, skipping save")
+            return
+            
+        metrics = {
+            'epoch': epoch,
+            'phase': phase,
+            'train_loss': train_loss,
+            'val_acc': val_acc,
+            'val_corrupt_acc': val_corrupt_acc
+        }
+        
+        # Create results directory structure
+        results_dir = f"results/{optimizer_name}/evaluation_results"
+        print(f"🐛 DEBUG: Creating directory: {results_dir}")
+        os.makedirs(results_dir, exist_ok=True)
+        
+        # Save metrics
+        metrics_file = os.path.join(results_dir, f"{phase}_epoch{epoch}_metrics.pt")
+        print(f"🐛 DEBUG: Saving metrics to: {metrics_file}")
+        torch.save(metrics, metrics_file)
+        
+        # Also save individual loss file for backward compatibility
+        loss_data = {
+            'epoch': epoch,
+            'phase': phase,
+            'loss': train_loss
+        }
+        loss_file = os.path.join(results_dir, f"{phase}_epoch{epoch}_loss.pt")
+        print(f"🐛 DEBUG: Saving loss to: {loss_file}")
+        torch.save(loss_data, loss_file)
+
     if bootstrap:
+        print(f"🐛 DEBUG: Taking bootstrap path")
         _bootstrap_mswag_particle(
             particle=particle,
             dataloader=dataloader,
@@ -315,13 +511,18 @@ def _mswag_particle(
             pretrain_epochs=pretrain_epochs,
             swag_epochs=swag_epochs,
             swag_pids=swag_pids,
+            val_dataloader=val_dataloader,
+            val_corrupt_dataloader=val_corrupt_dataloader,
+            save_metrics=save_metrics,
+            optimizer_name=optimizer_name,
         )
     else:
+        print(f"🐛 DEBUG: Taking normal training path")
         # TRAINING DONE HERE
         other_pids = [pid for pid in swag_pids if pid != particle.pid]
-
+        
         # Save initial weights before pretraining for all particles (epoch 0)
-        save_all_particle_weights(particle, other_pids, "pretrain_weights", 0)
+        save_all_particle_weights(particle, other_pids, f"results/{optimizer_name}/pretrain_weights", 0)
 
         tq = tqdm(range(pretrain_epochs))
         # Pre-training loop
@@ -334,19 +535,35 @@ def _mswag_particle(
                     for pid in other_pids
                 ]
                 losses += [fut.wait()]
-            tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+            
+            # Calculate average training loss
+            avg_train_loss = torch.mean(torch.tensor(losses)).item()
+            
+            # Evaluate on validation sets
+            val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+            val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+            
+            # Save metrics for this epoch
+            save_epoch_metrics(e + 1, "pretrain", avg_train_loss, val_acc, val_corrupt_acc, optimizer_name)
+            
+            # Update progress bar
+            tq.set_postfix({
+                "loss": avg_train_loss,
+                "val_acc": f"{val_acc:.3f}",
+                "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
+            })
 
             # Save weights after each pretraining epoch for all particles (epochs 1 to pretrain_epochs)
-            save_all_particle_weights(particle, other_pids, "pretrain_weights", e + 1)
+            save_all_particle_weights(particle, other_pids, f"results/{optimizer_name}/pretrain_weights", e + 1)
 
         # Initialize SWAG
         [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
         _swag_swag(particle, True, cov_mat_rank)
 
         # Save initial SWAG moments for all particles (epoch 0)
-        save_swag_moments(particle, "swag_moments", 0)
+        save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", 0)
         for pid in other_pids:
-            fut = particle.send(pid, "SAVE_SWAG_MOMENTS", "swag_moments", 0)
+            fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", 0)
             fut.wait()
 
         tq = tqdm(range(swag_epochs))
@@ -368,12 +585,43 @@ def _mswag_particle(
             ]
             _swag_swag(particle, False, cov_mat_rank)
             [f.wait() for f in futs]
-            tq.set_postfix({"loss": torch.mean(torch.tensor(losses))})
+            
+            # Calculate average training loss
+            avg_train_loss = torch.mean(torch.tensor(losses)).item()
+            
+            # For SWAG phase, we can evaluate using SWAG sampling
+            # Set model to mean for evaluation
+            if particle.pid in particle.state and "mom1" in particle.state[particle.pid]:
+                # Temporarily set model to SWAG mean for evaluation
+                original_params = [p.clone() for p in particle.module.parameters()]
+                for param, mean_param in zip(particle.module.parameters(), particle.state[particle.pid]["mom1"]):
+                    param.data.copy_(mean_param.data)
+                
+                # Evaluate with SWAG mean
+                val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+                val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+                
+                # Restore original parameters
+                for param, orig_param in zip(particle.module.parameters(), original_params):
+                    param.data.copy_(orig_param.data)
+            else:
+                val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+                val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+            
+            # Save metrics for this SWAG epoch
+            save_epoch_metrics(e + 1, "swag", avg_train_loss, val_acc, val_corrupt_acc, optimizer_name)
+            
+            # Update progress bar
+            tq.set_postfix({
+                "loss": avg_train_loss,
+                "val_acc": f"{val_acc:.3f}",
+                "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
+            })
 
             # Save SWAG moments after each SWAG epoch for all particles (epochs 1 to swag_epochs)
-            save_swag_moments(particle, "swag_moments", e + 1)
+            save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", e + 1)
             for pid in other_pids:
-                fut = particle.send(pid, "SAVE_SWAG_MOMENTS", "swag_moments", e + 1)
+                fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", e + 1)
                 fut.wait()
 
 
@@ -918,6 +1166,10 @@ class MultiSWAG(Infer):
         f_save=False,
         mswag_sample_entry=_mswag_sample_entry,
         mswag_sample=_mswag_sample,
+        val_dataloader=None,
+        val_corrupt_dataloader=None,
+        save_metrics: bool = True,
+        optimizer_name: str = "unknown",
     ):
         """
         Perform Bayesian inference using MultiSWAG.
@@ -935,6 +1187,10 @@ class MultiSWAG(Infer):
             f_save (bool): Flag to save each particle/model.
             mswag_sample_entry (Callable): Sampling function.
             mswag_sample (Callable): MultiSWAG sample function.
+            val_dataloader: Validation DataLoader.
+            val_corrupt_dataloader: Corrupted validation DataLoader.
+            save_metrics (bool): Whether to save metrics at each epoch.
+            optimizer_name (str): Name of the optimizer for organizing results.
 
         Returns:
             None
@@ -991,6 +1247,8 @@ class MultiSWAG(Infer):
                     },
                     state=mswag_state,
                 )
+                # Add optimizer name to particle for saving purposes
+                # self.push_dist.particles[param_pid].optimizer_name = optimizer_name
             return param_pid
 
         self.swag_pids = [mk_swag(n) for n in range(num_models)]
@@ -1010,6 +1268,10 @@ class MultiSWAG(Infer):
                     swag_epochs,
                     self.swag_pids,
                     bootstrap,
+                    val_dataloader,
+                    val_corrupt_dataloader,
+                    save_metrics,
+                    optimizer_name,
                 )
             ]
         )
@@ -1143,7 +1405,7 @@ class MultiSWAG(Infer):
             self.push_dist.p_wait([fut])
             
             # Initialize SWAG moments after loading weights (this creates mom1, mom2, cov_mat_sqrt from current model state)
-            fut = self.push_dist.p_launch(param_pid, "SWAG_SWAG", True, 20)  # cov_mat_rank=20
+            fut = self.push_dist.p_launch(param_pid, "SWAG_SWAG", True, 20)
             self.push_dist.p_wait([fut])
 
     def load_from_swag_epoch(
@@ -1254,6 +1516,10 @@ def train_mswag(
     f_save=False,
     mswag_sample_entry=_mswag_sample_entry,
     mswag_sample=_mswag_sample,
+    val_dataloader=None,
+    val_corrupt_dataloader=None,
+    save_metrics: bool = True,
+    optimizer_name: str = "unknown",
 ):
     """
     Train a MultiSWAG model.
@@ -1276,6 +1542,10 @@ def train_mswag(
         f_save (bool): Flag to save the model (default is False).
         mswag_sample_entry (Callable): MultiSWAG sample entry function (default is _mswag_sample_entry).
         mswag_sample (Callable): MultiSWAG sample function (default is _mswag_sample).
+        val_dataloader: Validation DataLoader.
+        val_corrupt_dataloader: Corrupted validation DataLoader.
+        save_metrics (bool): Whether to save metrics at each epoch.
+        optimizer_name (str): Name of the optimizer for organizing results.
 
     Returns:
         MultiSWAG: Trained MultiSWAG model.
@@ -1301,5 +1571,9 @@ def train_mswag(
         f_save=f_save,
         mswag_sample_entry=mswag_sample_entry,
         mswag_sample=mswag_sample,
+        val_dataloader=val_dataloader,
+        val_corrupt_dataloader=val_corrupt_dataloader,
+        save_metrics=save_metrics,
+        optimizer_name=optimizer_name,
     )
     return mswag
