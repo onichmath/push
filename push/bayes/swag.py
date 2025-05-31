@@ -317,9 +317,9 @@ def _bootstrap_mswag_particle(
     for e in tq:
         losses = []
         
-        # Initialize gradient accumulation for this epoch
-        accumulated_gradients = None
-        batch_count = 0
+        # Start epoch-level gradient norm tracking (memory efficient: only stores L2/spectral norm stats)
+        if tracking_utils and e < 5:  # Only track first 5 epochs to avoid storage issues
+            tracking_utils['gradient_tracker'].start_epoch_tracking(e + 1)
         
         for i, dataloader in enumerate(bootstrap_dataloaders):
             if i == 0:
@@ -328,49 +328,26 @@ def _bootstrap_mswag_particle(
                     loss_value = fut.wait()
                     losses.append(loss_value)
                     
-                    # Accumulate gradients for lead particle only (avoid overhead)
-                    if tracking_utils and e < 5:  # Only track first 5 epochs to avoid storage issues
+                    # Accumulate gradient norm statistics for epoch-level analysis
+                    if tracking_utils and e < 5:
                         try:
-                            # Accumulate gradients across batches
-                            if accumulated_gradients is None:
-                                accumulated_gradients = {}
-                                for name, param in particle.module.named_parameters():
-                                    if param.grad is not None:
-                                        accumulated_gradients[name] = param.grad.clone().detach().cpu()
-                            else:
-                                for name, param in particle.module.named_parameters():
-                                    if param.grad is not None and name in accumulated_gradients:
-                                        accumulated_gradients[name] += param.grad.detach().cpu()
-                            batch_count += 1
-                            
+                            tracking_utils['gradient_tracker'].accumulate_batch_gradients(
+                                particle.module, particle_id=0, batch_id=batch_idx
+                            )
                         except Exception as track_err:
-                            print(f"Warning: Gradient accumulation failed for epoch {e+1}, batch {batch_idx}: {track_err}")
+                            print(f"Warning: Gradient norm tracking failed for epoch {e+1}, batch {batch_idx}: {track_err}")
             else:
                 for data, label in dataloader:
                     fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
-                    # losses += [fut.wait()]  # Don't wait for other particles
-        
-        # Save aggregated gradients once per epoch
-        if tracking_utils and e < 5 and accumulated_gradients is not None and batch_count > 0:
+            
+        # Compute and save epoch gradient norm statistics (L2 and spectral norms)
+        if tracking_utils and e < 5:
             try:
-                # Average the accumulated gradients
-                averaged_gradients = {}
-                for name, grad_sum in accumulated_gradients.items():
-                    averaged_gradients[name] = grad_sum / batch_count
-                
-                # Save averaged gradients
-                tracking_utils['gradient_tracker'].save_aggregated_gradients(
-                    averaged_gradients, particle_id=0, epoch=e+1
-                )
-                
-                # Save gradient norms
-                tracking_utils['gradient_tracker'].save_gradient_norms(
-                    particle.module, particle_id=0, epoch=e+1
-                )
-                
-                print(f"Saved aggregated gradients for epoch {e+1} (averaged over {batch_count} batches)")
+                epoch_stats = tracking_utils['gradient_tracker'].compute_epoch_statistics()
+                if epoch_stats:
+                    print(f"Computed gradient norm mean/variance statistics for epoch {e+1}")
             except Exception as track_err:
-                print(f"Warning: Aggregated gradient saving failed for epoch {e+1}: {track_err}")
+                print(f"Warning: Epoch gradient norm statistics failed for epoch {e+1}: {track_err}")
         
         # Calculate average training loss
         avg_train_loss = torch.mean(torch.tensor(losses)).item()
@@ -401,7 +378,7 @@ def _bootstrap_mswag_particle(
                         val_loss=val_loss,
                         particle_id=0,
                         epoch=e+1,
-                        additional_metrics={'phase': 'pretrain', 'total_batches': batch_count}
+                        additional_metrics={'phase': 'pretrain'}
                     )
             except Exception as e_err:
                 val_loss = 0.0
@@ -419,22 +396,7 @@ def _bootstrap_mswag_particle(
         # Save weights after each pretraining epoch for all particles
         save_all_particle_weights(particle, other_pids, f"results/{optimizer_name}/pretrain_weights", e + 1)
         
-        # Compute weight distances between particles for tracking (every 2 epochs to avoid overhead)
-        if tracking_utils and (e + 1) % 2 == 0:
-            try:
-                # Load weights for all particles at this epoch
-                weights_list = []
-                for pid in range(len(swag_pids)):
-                    weight_file = f"results/{optimizer_name}/pretrain_weights/particle{pid}_epoch{e+1}_weights.pt"
-                    if os.path.exists(weight_file):
-                        weights = torch.load(weight_file, map_location='cpu')
-                        weights_list.append(weights)
-                
-                if len(weights_list) > 1:
-                    tracking_utils['distance_tracker'].compute_pairwise_distances(weights_list, e + 1)
-                    print(f"Computed weight distances for epoch {e+1} ({len(weights_list)} particles)")
-            except Exception as dist_err:
-                print(f"Warning: Distance tracking failed for epoch {e+1}: {dist_err}")
+        # Note: Weight distance computation removed for performance optimization
 
     # Initialize SWAG
     [particle.send(pid, "SWAG_SWAG", True, cov_mat_rank) for pid in other_pids]
@@ -450,9 +412,9 @@ def _bootstrap_mswag_particle(
     for e in tq:
         losses = []
         
-        # Initialize gradient accumulation for this SWAG epoch
-        accumulated_gradients = None
-        batch_count = 0
+        # Start epoch-level gradient norm tracking for SWAG phase
+        if tracking_utils and e < 3:  # Track first 3 SWAG epochs
+            tracking_utils['gradient_tracker'].start_epoch_tracking(pretrain_epochs + e + 1)
         
         for i, dataloader in enumerate(bootstrap_dataloaders):
             if i == 0:
@@ -461,100 +423,75 @@ def _bootstrap_mswag_particle(
                     loss_value = fut.wait()
                     losses.append(loss_value)
                     
-                    # Accumulate gradients for SWAG phase (first few epochs only)
-                    if tracking_utils and e < 3:  # Track first 3 SWAG epochs
+                    # Accumulate gradient norm statistics for SWAG phase analysis
+                    if tracking_utils and e < 3:
                         try:
-                            # Accumulate gradients across batches
-                            if accumulated_gradients is None:
-                                accumulated_gradients = {}
-                                for name, param in particle.module.named_parameters():
-                                    if param.grad is not None:
-                                        accumulated_gradients[name] = param.grad.clone().detach().cpu()
-                            else:
-                                for name, param in particle.module.named_parameters():
-                                    if param.grad is not None and name in accumulated_gradients:
-                                        accumulated_gradients[name] += param.grad.detach().cpu()
-                            batch_count += 1
-                            
+                            tracking_utils['gradient_tracker'].accumulate_batch_gradients(
+                                particle.module, particle_id=0, batch_id=batch_idx
+                            )
                         except Exception as track_err:
-                            print(f"Warning: SWAG gradient accumulation failed for epoch {e+1}, batch {batch_idx}: {track_err}")
+                            print(f"Warning: SWAG gradient norm tracking failed for epoch {pretrain_epochs + e + 1}, batch {batch_idx}: {track_err}")
             else:
                 for data, label in dataloader:
                     fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
+            
+            futs = [
+                particle.send(pid, "SWAG_SWAG", False, cov_mat_rank) for pid in other_pids
+            ]
+            _swag_swag(particle, False, cov_mat_rank)
+            [f.wait() for f in futs]
+            
+            # Calculate average training loss
+            avg_train_loss = torch.mean(torch.tensor(losses)).item()
+            
+            # For SWAG phase, evaluate using SWAG mean
+            if particle.pid in particle.state and "mom1" in particle.state[particle.pid]:
+                # Temporarily set model to SWAG mean for evaluation
+                original_params = [p.clone() for p in particle.module.parameters()]
+                for param, mean_param in zip(particle.module.parameters(), particle.state[particle.pid]["mom1"]):
+                    param.data.copy_(mean_param.data)
+                
+                # Evaluate with SWAG mean
+                val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+                val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+                
+                # Restore original parameters
+                for param, orig_param in zip(particle.module.parameters(), original_params):
+                    param.data.copy_(orig_param.data)
+            else:
+                val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
+                val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
+            
+            # Save metrics for this SWAG epoch
+            save_epoch_metrics(e + 1, "swag", avg_train_loss, val_acc, val_corrupt_acc, optimizer_name)
+            
+            # Update progress bar
+            tq.set_postfix({
+                "loss": avg_train_loss,
+                "val_acc": f"{val_acc:.3f}",
+                "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
+            })
+
+            # Save SWAG moments after each SWAG epoch for all particles
+            save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", e + 1)
+            for pid in other_pids:
+                fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", e + 1)
+                fut.wait()
+
+        # Compute and save SWAG epoch gradient norm statistics
+        if tracking_utils and e < 3:
+            try:
+                epoch_stats = tracking_utils['gradient_tracker'].compute_epoch_statistics()
+                if epoch_stats:
+                    print(f"Computed SWAG gradient norm mean/variance statistics for epoch {pretrain_epochs + e + 1}")
+            except Exception as track_err:
+                print(f"Warning: SWAG epoch gradient norm statistics failed for epoch {pretrain_epochs + e + 1}: {track_err}")
         
         futs = [
             particle.send(pid, "SWAG_SWAG", False, cov_mat_rank) for pid in other_pids
         ]
         _swag_swag(particle, False, cov_mat_rank)
         [f.wait() for f in futs]
-        
-        # Save aggregated gradients once per SWAG epoch
-        if tracking_utils and e < 3 and accumulated_gradients is not None and batch_count > 0:
-            try:
-                # Average the accumulated gradients
-                averaged_gradients = {}
-                for name, grad_sum in accumulated_gradients.items():
-                    averaged_gradients[name] = grad_sum / batch_count
-                
-                # Save averaged gradients
-                tracking_utils['gradient_tracker'].save_aggregated_gradients(
-                    averaged_gradients, particle_id=0, epoch=pretrain_epochs+e+1
-                )
-                
-                # Save gradient norms
-                tracking_utils['gradient_tracker'].save_gradient_norms(
-                    particle.module, particle_id=0, epoch=pretrain_epochs+e+1
-                )
-                
-                print(f"Saved aggregated SWAG gradients for epoch {pretrain_epochs+e+1} (averaged over {batch_count} batches)")
-                
-                # Save loss information for SWAG phase
-                tracking_utils['landscape_tracker'].save_loss_components(
-                    train_loss=torch.mean(torch.tensor(losses)).item(),
-                    val_loss=0.0,  # Will compute below
-                    particle_id=0,
-                    epoch=pretrain_epochs+e+1,
-                    additional_metrics={'phase': 'swag', 'total_batches': batch_count}
-                )
-            except Exception as track_err:
-                print(f"Warning: SWAG aggregated gradient saving failed for epoch {e+1}: {track_err}")
-        
-        # Calculate average training loss
-        avg_train_loss = torch.mean(torch.tensor(losses)).item()
-        
-        # For SWAG phase, evaluate using SWAG mean
-        if particle.pid in particle.state and "mom1" in particle.state[particle.pid]:
-            # Temporarily set model to SWAG mean for evaluation
-            original_params = [p.clone() for p in particle.module.parameters()]
-            for param, mean_param in zip(particle.module.parameters(), particle.state[particle.pid]["mom1"]):
-                param.data.copy_(mean_param.data)
-            
-            # Evaluate with SWAG mean
-            val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
-            val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
-            
-            # Restore original parameters
-            for param, orig_param in zip(particle.module.parameters(), original_params):
-                param.data.copy_(orig_param.data)
-        else:
-            val_acc = evaluate_model(particle.module, val_dataloader, particle.device)
-            val_corrupt_acc = evaluate_model(particle.module, val_corrupt_dataloader, particle.device)
-        
-        # Save metrics for this SWAG epoch
-        save_epoch_metrics(e + 1, "swag", avg_train_loss, val_acc, val_corrupt_acc)
-        
-        # Update progress bar
-        tq.set_postfix({
-            "loss": avg_train_loss,
-            "val_acc": f"{val_acc:.3f}",
-            "val_corrupt_acc": f"{val_corrupt_acc:.3f}"
-        })
-
-        # Save SWAG moments after each SWAG epoch for all particles
-        save_swag_moments(particle, f"results/{optimizer_name}/swag_moments", e + 1)
-        for pid in other_pids:
-            fut = particle.send(pid, "SAVE_SWAG_MOMENTS", f"results/{optimizer_name}/swag_moments", e + 1)
-            fut.wait()
 
 
 def _mswag_particle(
@@ -719,33 +656,14 @@ def _mswag_particle(
         # SWAG epochs
         for e in tq:
             losses = []
-            for i, dataloader in enumerate(bootstrap_dataloaders):
-                if i == 0:
-                    for batch_idx, (data, label) in enumerate(dataloader):
-                        fut = particle.step(loss_fn, data, label)
-                        loss_value = fut.wait()
-                        losses.append(loss_value)
-                        
-                        # Accumulate gradients for SWAG phase (first few epochs only)
-                        if tracking_utils and e < 3:  # Track first 3 SWAG epochs
-                            try:
-                                # Accumulate gradients across batches
-                                if accumulated_gradients is None:
-                                    accumulated_gradients = {}
-                                    for name, param in particle.module.named_parameters():
-                                        if param.grad is not None:
-                                            accumulated_gradients[name] = param.grad.clone().detach().cpu()
-                                else:
-                                    for name, param in particle.module.named_parameters():
-                                        if param.grad is not None and name in accumulated_gradients:
-                                            accumulated_gradients[name] += param.grad.detach().cpu()
-                                batch_count += 1
-                                
-                            except Exception as track_err:
-                                print(f"Warning: SWAG gradient accumulation failed for epoch {e+1}, batch {batch_idx}: {track_err}")
-                else:
-                    for data, label in dataloader:
-                        fut = particle.send(swag_pids[i], "SWAG_STEP", loss_fn, data, label)
+            for data, label in dataloader:
+                fut = particle.step(loss_fn, data, label)
+                futs = [
+                    particle.send(pid, "SWAG_STEP", loss_fn, data, label)
+                    for pid in other_pids
+                ]
+                losses += [fut.wait()]
+                [f.wait() for f in futs]
             
             futs = [
                 particle.send(pid, "SWAG_SWAG", False, cov_mat_rank)
@@ -753,37 +671,6 @@ def _mswag_particle(
             ]
             _swag_swag(particle, False, cov_mat_rank)
             [f.wait() for f in futs]
-            
-            # Save aggregated gradients once per SWAG epoch
-            if tracking_utils and e < 3 and accumulated_gradients is not None and batch_count > 0:
-                try:
-                    # Average the accumulated gradients
-                    averaged_gradients = {}
-                    for name, grad_sum in accumulated_gradients.items():
-                        averaged_gradients[name] = grad_sum / batch_count
-                    
-                    # Save averaged gradients
-                    tracking_utils['gradient_tracker'].save_aggregated_gradients(
-                        averaged_gradients, particle_id=0, epoch=pretrain_epochs+e+1
-                    )
-                    
-                    # Save gradient norms
-                    tracking_utils['gradient_tracker'].save_gradient_norms(
-                        particle.module, particle_id=0, epoch=pretrain_epochs+e+1
-                    )
-                    
-                    print(f"Saved aggregated SWAG gradients for epoch {pretrain_epochs+e+1} (averaged over {batch_count} batches)")
-                    
-                    # Save loss information for SWAG phase
-                    tracking_utils['landscape_tracker'].save_loss_components(
-                        train_loss=torch.mean(torch.tensor(losses)).item(),
-                        val_loss=0.0,  # Will compute below
-                        particle_id=0,
-                        epoch=pretrain_epochs+e+1,
-                        additional_metrics={'phase': 'swag', 'total_batches': batch_count}
-                    )
-                except Exception as track_err:
-                    print(f"Warning: SWAG aggregated gradient saving failed for epoch {e+1}: {track_err}")
             
             # Calculate average training loss
             avg_train_loss = torch.mean(torch.tensor(losses)).item()
